@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Packaging / distribution ---
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+
+# --- PyInstaller ---
+# Auto-generated on each build from the command-line options -- only
+# keep a .spec file under version control if you've hand-edited it
+# for something the CLI flags can't express.
+*.spec
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db

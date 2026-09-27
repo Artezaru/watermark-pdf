@@ -1,0 +1,47 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "setuptools-scm>=8.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "watermark-pdf"
+requires-python = ">= 3.10"
+dynamic = ["version"]
+description = "Qt-GUI python based to add watermark on PDFs"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Artezaru", email = "artezaru.github@proton.me"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pyqt5",
+    "reportlab",
+    "pypdf",
+]
+
+[project.optional-dependencies]
+progress = ["tqdm"]
+
+[project.gui-scripts]
+watermark-pdf = "watermark_pdf.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Artezaru/watermark-pdf"
+Source = "https://github.com/Artezaru/watermark-pdf"
+Tracker = "https://github.com/Artezaru/watermark/issues-pdf"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["watermark_pdf", "watermark_pdf.*"]
+
+[tool.setuptools.package-data]
+watermark_pdf = ["resources/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "watermark_pdf.__version__.__version__"}
