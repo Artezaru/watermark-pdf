@@ -1,5 +1,5 @@
 """
-watermark - Qt-GUI python based to add watermark on PDFs.
+watermark-pdf - Qt-GUI python based to add watermark on PDFs.
 Copyright (C) 2026 Artezaru, artezaru.github@proton.me
 
 This program is free software: you can redistribute it and/or modify
@@ -23,7 +23,7 @@ import sys
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication
-from .watermark_ui import WatermarkWindow, FONT_SUBSTITUTES, APP_NAME, ORG_NAME
+from watermark_pdf.watermark_ui import WatermarkWindow, FONT_SUBSTITUTES, APP_NAME, ORG_NAME
 
 def main() -> None:
     """

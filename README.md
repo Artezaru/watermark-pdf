@@ -24,7 +24,7 @@ Download the latest release for your platform from the [Releases page](https://g
 - **Windows**: download and run `watermark-pdf-windows.exe` directly — no installation needed.
 - **Linux (Debian/Ubuntu)**: download the `.deb` package and install it with:
   ```bash
-  sudo apt install ./watermark-pdf_*.deb
+  sudo dpkg -i watermark-pdf_*.deb
   ```
   watermark-pdf will then appear in your applications menu as *PDF Watermark*, or can be launched from a terminal with `watermark-pdf`.
 
