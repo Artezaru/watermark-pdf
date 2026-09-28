@@ -30,8 +30,8 @@ TRANSLATIONS = {
                         'Check for a new release on:<br><a href="{url}">{url}</a>',
         # Text
         "text_card": "Text",
-        "placeholder_text": "CONFIDENTIAL",
-        "text_hint": "Multi-line allowed.",
+        "placeholder_text": "e.g. CONFIDENTIAL",
+        "text_hint": "Type your watermark text.",
         # Style
         "style_card": "Style",
         "font": "Font",
@@ -116,8 +116,8 @@ TRANSLATIONS = {
         "updates_text": 'Vous utilisez la version {version}.<br><br>'
                         'Vérifiez si une nouvelle version est disponible :<br><a href="{url}">{url}</a>',
         "text_card": "Texte",
-        "placeholder_text": "CONFIDENTIEL",
-        "text_hint": "Multiligne autorisé.",
+        "placeholder_text": "Ex. : CONFIDENTIEL",
+        "text_hint": "Saisissez le texte du filigrane.",
         "style_card": "Style",
         "font": "Police",
         "font_size": "Taille",
@@ -194,8 +194,8 @@ TRANSLATIONS = {
         "updates_text": 'Está usando la versión {version}.<br><br>'
                         'Compruebe si hay una nueva versión en:<br><a href="{url}">{url}</a>',
         "text_card": "Texto",
-        "placeholder_text": "CONFIDENCIAL",
-        "text_hint": "Se permiten varias líneas.",
+        "placeholder_text": "Ej.: CONFIDENCIAL",
+        "text_hint": "Escriba el texto de la marca de agua.",
         "style_card": "Estilo",
         "font": "Fuente",
         "font_size": "Tamaño",
@@ -272,8 +272,8 @@ TRANSLATIONS = {
         "updates_text": 'Stai usando la versione {version}.<br><br>'
                         'Verifica se è disponibile una nuova versione su:<br><a href="{url}">{url}</a>',
         "text_card": "Testo",
-        "placeholder_text": "CONFIDENZIALE",
-        "text_hint": "Più righe consentite.",
+        "placeholder_text": "Es.: CONFIDENZIALE",
+        "text_hint": "Digita il testo della filigrana.",
         "style_card": "Stile",
         "font": "Carattere",
         "font_size": "Dimensione",
@@ -350,8 +350,8 @@ TRANSLATIONS = {
         "updates_text": 'Sie verwenden Version {version}.<br><br>'
                         'Prüfen Sie, ob eine neue Version verfügbar ist:<br><a href="{url}">{url}</a>',
         "text_card": "Text",
-        "placeholder_text": "VERTRAULICH",
-        "text_hint": "Mehrzeilig möglich.",
+        "placeholder_text": "z. B. VERTRAULICH",
+        "text_hint": "Wasserzeichentext eingeben.",
         "style_card": "Stil",
         "font": "Schriftart",
         "font_size": "Größe",

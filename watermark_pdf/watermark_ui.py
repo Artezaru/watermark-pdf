@@ -237,9 +237,9 @@ QComboBox:focus { border-color: %(accent)s; }
 QComboBox:disabled { color: %(disabled)s; }
 QComboBox::drop-down { border: none; width: 26px; }
 QComboBox::down-arrow {
-    width: 0; height: 0;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid %(muted)s;
+    image: url(%(arrow)s);
+    width: 10px; height: 6px;
+    margin-right: 6px;
 }
 QComboBox QAbstractItemView {
     background: %(surface)s; border: 1px solid %(border)s; padding: 4px; outline: 0;
@@ -1388,7 +1388,9 @@ class WatermarkWindow(QMainWindow):
     # ==================================================================
 
     def _apply_theme(self) -> None:
-        colors = THEMES[self.theme]
+        colors = dict(THEMES[self.theme])
+        arrow = resources.files(__package__) / "resources" / f"arrow_down_{self.theme}.svg"
+        colors["arrow"] = Path(str(arrow)).as_posix()
         _apply_palette(QApplication.instance(), colors)
         self.setStyleSheet(STYLESHEET % colors)
 
