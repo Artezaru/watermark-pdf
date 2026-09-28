@@ -20,15 +20,18 @@ TRANSLATIONS = {
     # ------------------------------------------------------------------
     "en": {
         "title": "PDF Watermark",
-        "subtitle": "Add a repeated text watermark to your PDF files",
+        "subtitle": "Add a watermark to your PDF files",
         "language": "Language",
         "theme": "Toggle light / dark theme",
         "reset": "Reset",
         "reset_tip": "Restore the default watermark settings",
+        "updates": "Updates",
+        "updates_text": 'You are using version {version}.<br><br>'
+                        'Check for a new release on:<br><a href="{url}">{url}</a>',
         # Text
         "text_card": "Text",
         "placeholder_text": "CONFIDENTIAL",
-        "text_hint": "One line per row. Press Enter for a multi-line watermark.",
+        "text_hint": "Multi-line allowed.",
         # Style
         "style_card": "Style",
         "font": "Font",
@@ -104,14 +107,17 @@ TRANSLATIONS = {
     # ------------------------------------------------------------------
     "fr": {
         "title": "Filigrane PDF",
-        "subtitle": "Ajoutez un filigrane texte répété à vos fichiers PDF",
+        "subtitle": "Ajoutez un filigrane à vos fichiers PDF",
         "language": "Langue",
         "theme": "Basculer thème clair / sombre",
         "reset": "Réinitialiser",
         "reset_tip": "Rétablir les réglages par défaut du filigrane",
+        "updates": "Mises à jour",
+        "updates_text": 'Vous utilisez la version {version}.<br><br>'
+                        'Vérifiez si une nouvelle version est disponible :<br><a href="{url}">{url}</a>',
         "text_card": "Texte",
         "placeholder_text": "CONFIDENTIEL",
-        "text_hint": "Appuyez sur Entrée pour un filigrane sur plusieurs lignes.",
+        "text_hint": "Multiligne autorisé.",
         "style_card": "Style",
         "font": "Police",
         "font_size": "Taille",
@@ -179,14 +185,17 @@ TRANSLATIONS = {
     # ------------------------------------------------------------------
     "es": {
         "title": "Marca de agua PDF",
-        "subtitle": "Añada una marca de agua de texto repetida a sus PDF",
+        "subtitle": "Añada una marca de agua a sus archivos PDF",
         "language": "Idioma",
         "theme": "Cambiar tema claro / oscuro",
         "reset": "Restablecer",
         "reset_tip": "Restaurar los ajustes predeterminados de la marca de agua",
+        "updates": "Actualizaciones",
+        "updates_text": 'Está usando la versión {version}.<br><br>'
+                        'Compruebe si hay una nueva versión en:<br><a href="{url}">{url}</a>',
         "text_card": "Texto",
         "placeholder_text": "CONFIDENCIAL",
-        "text_hint": "Pulse Intro para una marca de agua de varias líneas.",
+        "text_hint": "Se permiten varias líneas.",
         "style_card": "Estilo",
         "font": "Fuente",
         "font_size": "Tamaño",
@@ -254,14 +263,17 @@ TRANSLATIONS = {
     # ------------------------------------------------------------------
     "it": {
         "title": "Filigrana PDF",
-        "subtitle": "Aggiungi una filigrana di testo ripetuta ai tuoi PDF",
+        "subtitle": "Aggiungi una filigrana ai tuoi file PDF",
         "language": "Lingua",
         "theme": "Alterna tema chiaro / scuro",
         "reset": "Ripristina",
         "reset_tip": "Ripristina le impostazioni predefinite della filigrana",
+        "updates": "Aggiornamenti",
+        "updates_text": 'Stai usando la versione {version}.<br><br>'
+                        'Verifica se è disponibile una nuova versione su:<br><a href="{url}">{url}</a>',
         "text_card": "Testo",
         "placeholder_text": "CONFIDENZIALE",
-        "text_hint": "Premi Invio per una filigrana su più righe.",
+        "text_hint": "Più righe consentite.",
         "style_card": "Stile",
         "font": "Carattere",
         "font_size": "Dimensione",
@@ -329,14 +341,17 @@ TRANSLATIONS = {
     # ------------------------------------------------------------------
     "de": {
         "title": "PDF-Wasserzeichen",
-        "subtitle": "Fügen Sie Ihren PDF-Dateien ein wiederholtes Text-Wasserzeichen hinzu",
+        "subtitle": "Fügen Sie Ihren PDF-Dateien ein Wasserzeichen hinzu",
         "language": "Sprache",
         "theme": "Helles / dunkles Design umschalten",
         "reset": "Zurücksetzen",
         "reset_tip": "Standardeinstellungen des Wasserzeichens wiederherstellen",
+        "updates": "Updates",
+        "updates_text": 'Sie verwenden Version {version}.<br><br>'
+                        'Prüfen Sie, ob eine neue Version verfügbar ist:<br><a href="{url}">{url}</a>',
         "text_card": "Text",
         "placeholder_text": "VERTRAULICH",
-        "text_hint": "Drücken Sie Enter für ein mehrzeiliges Wasserzeichen.",
+        "text_hint": "Mehrzeilig möglich.",
         "style_card": "Stil",
         "font": "Schriftart",
         "font_size": "Größe",

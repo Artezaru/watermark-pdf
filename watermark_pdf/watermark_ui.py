@@ -17,6 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from __future__ import annotations
+from .__version__ import __version__
 
 import sys
 import threading
@@ -100,8 +101,11 @@ from .watermark import (
 # Configuration
 # ============================================================================
 
+RELEASES_URL = "https://github.com/Artezaru/watermark-pdf/releases"
+
 APP_NAME = "PDF Watermark"
 ORG_NAME = "Artezaru"
+VERSION = __version__
 
 LANGUAGES = {
     "English": "en",
@@ -843,6 +847,10 @@ class PreviewCanvas(QWidget):
         self.guides = False
         self.empty_message = ""
         self.error_title = "Error"
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self._drag_origin = None
+        self.setCursor(Qt.OpenHandCursor)
 
     def set_config(self, page_size, caption: str, text: str, options: dict, guides: bool) -> None:
         self.page_size = page_size
@@ -851,6 +859,46 @@ class PreviewCanvas(QWidget):
         self.options = options
         self.guides = guides
         self.update()
+
+    def _view_center(self) -> QPointF:
+        return QPointF(self.width() / 2, (self.height() - 26.0) / 2)
+
+    def reset_view(self) -> None:
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self.update()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        steps = event.angleDelta().y() / 120
+        new_zoom = min(20.0, max(1.0, self.zoom * 1.15 ** steps))
+        if new_zoom == 1.0:
+            self.reset_view()
+            return
+        # Keep the point under the cursor fixed.
+        cursor = QPointF(event.pos())
+        center = self._view_center() + self.pan
+        k = new_zoom / self.zoom
+        self.pan = cursor - (cursor - center) * k - self._view_center()
+        self.zoom = new_zoom
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self.zoom > 1.0:
+            self._drag_origin = (QPointF(event.pos()), QPointF(self.pan))
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_origin is not None:
+            start, pan = self._drag_origin
+            self.pan = pan + QPointF(event.pos()) - start
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_origin = None
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        self.reset_view()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -862,10 +910,11 @@ class PreviewCanvas(QWidget):
         pad, caption_h = 28.0, 26.0
         scale = min((self.width() - 2 * pad) / page_w,
                     (self.height() - 2 * pad - caption_h) / page_h)
-        scale = max(scale, 0.05)
+        scale = max(scale, 0.05) * self.zoom
         w, h = page_w * scale, page_h * scale
-        page = QRectF((self.width() - w) / 2, (self.height() - caption_h - h) / 2, w, h)
-
+        page = QRectF((self.width() - w) / 2 + self.pan.x(),
+                      (self.height() - caption_h - h) / 2 + self.pan.y(), w, h)
+        
         # Soft shadow + paper.
         p.setPen(Qt.NoPen)
         for i in range(1, 9):
@@ -1016,8 +1065,8 @@ class WatermarkWindow(QMainWindow):
     # ==================================================================
 
     def _build_ui(self) -> None:
-        self.setMinimumSize(1040, 680)
-        self.resize(1280, 820)
+        self.setMinimumSize(995, 650)
+        self.resize(1050, 700)
 
         root = QWidget(objectName="root")
         self.setCentralWidget(root)
@@ -1081,6 +1130,11 @@ class WatermarkWindow(QMainWindow):
         self.language_combo.setCurrentIndex(max(0, self.language_combo.findData(self.language)))
         self.language_combo.currentIndexChanged.connect(self._language_changed)
         layout.addWidget(self.language_combo)
+
+        self.update_button = QPushButton(objectName="ghost")
+        self.update_button.setCursor(Qt.PointingHandCursor)
+        self.update_button.clicked.connect(self.show_updates)
+        layout.addWidget(self.update_button)
 
         self.theme_button = QToolButton(objectName="ghost")
         self.theme_button.setCursor(Qt.PointingHandCursor)
@@ -1375,6 +1429,7 @@ class WatermarkWindow(QMainWindow):
         self.title_label.setText(t("title"))
         self.subtitle_label.setText(t("subtitle"))
         self.language_combo.setToolTip(t("language"))
+        self.update_button.setText(t("updates"))
         self.theme_button.setToolTip(t("theme"))
 
         self.text_card.setTitle(t("text_card"))
@@ -1478,6 +1533,7 @@ class WatermarkWindow(QMainWindow):
         self.input_path = path
         self.last_output_dir = None
         self.open_button.setEnabled(False)
+        self.canvas.reset_view()
         self._refresh_selection()
         self._refresh_preview()
 
@@ -1592,6 +1648,7 @@ class WatermarkWindow(QMainWindow):
         is_auto = self.page_combo.currentData() == "auto"
         self.portrait_button.setEnabled(not is_auto)
         self.landscape_button.setEnabled(not is_auto)
+        self.canvas.reset_view()
         self._refresh_preview()
 
     def _get_options(self) -> dict:
@@ -1777,6 +1834,13 @@ class WatermarkWindow(QMainWindow):
     def open_output_folder(self) -> None:
         if self.last_output_dir is not None and self.last_output_dir.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_output_dir)))
+
+    def show_updates(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(self._t("updates"))
+        box.setTextFormat(Qt.RichText)
+        box.setText(self._t("updates_text", version=VERSION, url=RELEASES_URL))
+        box.exec_()
 
     # ==================================================================
     # Status & log
