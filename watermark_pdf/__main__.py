@@ -21,15 +21,15 @@ from __future__ import annotations
 import sys
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication
-from watermark_pdf.watermark_ui import WatermarkWindow, FONT_SUBSTITUTES, APP_NAME, ORG_NAME
+from watermark_pdf.watermark_ui import APP_NAME, ORG_NAME, WatermarkWindow
+
 
 def main() -> None:
     """
     Application entry point.
 
-    Runs via ``python -m watermark`` (this module is ``bippass``'s
+    Runs via ``python -m watermark_pdf`` (this module is the package's
     ``__main__.py``) as well as any console-script entry point
     declared for the package (e.g. in ``pyproject.toml``, so a
     PyInstaller build's launcher can import and call this directly).
@@ -41,9 +41,6 @@ def main() -> None:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
-
-    for family, substitutes in FONT_SUBSTITUTES.items():
-        QFont.insertSubstitutions(family, substitutes)
 
     window = WatermarkWindow()
     window.show()

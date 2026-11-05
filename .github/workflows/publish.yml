@@ -1,0 +1,71 @@
+# =============================================================================
+#  Publish the Python package to PyPI when a "v*" tag is pushed.
+#
+#  Generic workflow: ONLY edit the `env:` block below for a new repository.
+#  Copy this file to .github/workflows/publish.yml
+#
+#  Required secret (Settings > Secrets and variables > Actions):
+#    PYPI_PROJECT_TOKEN : PyPI API token for this project.
+# =============================================================================
+
+name: Publish Python Package to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+    workflow_dispatch: {}
+
+env:
+  # File that contains __version__ = "x.y.z". The tag (v x.y.z) is checked
+  # against it before publishing. Leave empty "" to skip the check.
+  VERSION_FILE: "watermark_pdf/__version__.py"
+  PYTHON_VERSION: "3.11"
+
+# =============================================================================
+#  Nothing to change below this line.
+# =============================================================================
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Check tag matches package version
+        if: env.VERSION_FILE != ''
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          FILE_VERSION=$(grep -m1 "__version__" "$VERSION_FILE" \
+            | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
+
+          echo "Tag version:  $TAG_VERSION"
+          echo "File version: $FILE_VERSION"
+
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match __version__ = $FILE_VERSION in $VERSION_FILE"
+            exit 1
+          fi
+
+      - name: Build package
+        run: python -m build
+
+      - name: Check package
+        run: python -m twine check dist/*
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_PROJECT_TOKEN }}
+        run: python -m twine upload dist/*

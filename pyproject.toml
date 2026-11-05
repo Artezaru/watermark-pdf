@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "watermark-pdf"
-requires-python = ">= 3.10"
+requires-python = ">= 3.11"
 dynamic = ["version"]
 description = "Qt-GUI python based to add watermark on PDFs"
 license = {file = "LICENSE"}
@@ -23,10 +23,13 @@ dependencies = [
     "pyqt5",
     "reportlab",
     "pypdf",
+    "fonttools",
 ]
 
 [project.optional-dependencies]
 progress = ["tqdm"]
+preview = ["pypdfium2>=4"]
+all = ["watermark-pdf[progress,preview]"]
 
 [project.gui-scripts]
 watermark-pdf = "watermark_pdf.__main__:main"
@@ -34,14 +37,14 @@ watermark-pdf = "watermark_pdf.__main__:main"
 [project.urls]
 Homepage = "https://github.com/Artezaru/watermark-pdf"
 Source = "https://github.com/Artezaru/watermark-pdf"
-Tracker = "https://github.com/Artezaru/watermark/issues-pdf"
+Tracker = "https://github.com/Artezaru/watermark-pdf/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["watermark_pdf", "watermark_pdf.*"]
 
 [tool.setuptools.package-data]
-watermark_pdf = ["resources/*"]
+watermark_pdf = ["resources/*", "resources/fonts/*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "watermark_pdf.__version__.__version__"}

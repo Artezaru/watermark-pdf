@@ -19,9 +19,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 from .__version__ import __version__
 
+import math
+import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from importlib import resources
 from pathlib import Path
 from typing import Optional
@@ -33,6 +36,7 @@ from PyQt5.QtCore import (
     QPropertyAnimation,
     QRectF,
     QSize,
+    QStandardPaths,
     Qt,
     QThread,
     QUrl,
@@ -40,12 +44,13 @@ from PyQt5.QtCore import (
     pyqtSignal,
 )
 from PyQt5.QtGui import (
+    QBrush,
     QColor,
     QConicalGradient,
     QDesktopServices,
     QFont,
-    QFontMetricsF,
     QIcon,
+    QImage,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -84,16 +89,26 @@ from PyQt5.QtWidgets import (
 )
 from reportlab.lib.pagesizes import A3, A4, A5, legal, letter
 
+try:  # optional: renders the PDF pages behind the watermark ("show source")
+    import pypdfium2 as pdfium
+except Exception:  # not installed, or its native library failed to load
+    pdfium = None
+
+from .pages import PageSelectionError, parse_pages, to_page_indices
 from .translation import TRANSLATIONS
 from .watermark import (
-    LINE_SPACING,
-    STANDARD_FONTS,
+    DEFAULT_FONT,
+    DestinationExistsError,
     WatermarkCancelled,
     WatermarkStyle,
-    add_watermark,
+    available_fonts,
     batch_watermark_directory,
     count_pdf_pages,
     get_page_size,
+    path_key,
+    register_font,
+    text_block_outline,
+    watermark_files,
 )
 
 
@@ -135,20 +150,9 @@ DEFAULTS = {
     "opacity": 10,        # percent
     "angle": 45,          # degrees
     "color": "#000000",
-    "font": "Helvetica",
+    "font": DEFAULT_FONT,
     "size": 12.0,         # points
 }
-
-# PDF standard fonts -> installed look-alikes, for the on-screen preview.
-FONT_SUBSTITUTES = {
-    "Helvetica": ["Arial", "Liberation Sans", "Nimbus Sans", "Nimbus Sans L",
-                  "TeX Gyre Heros", "DejaVu Sans"],
-    "Times": ["Times New Roman", "Liberation Serif", "Nimbus Roman",
-              "Nimbus Roman No9 L", "TeX Gyre Termes", "DejaVu Serif"],
-    "Courier": ["Courier New", "Liberation Mono", "Nimbus Mono PS",
-                "Nimbus Mono L", "TeX Gyre Cursor", "DejaVu Sans Mono"],
-}
-
 
 # ============================================================================
 # Theme
@@ -214,6 +218,7 @@ QLabel#appSubtitle { color: %(muted)s; }
 QLabel#fieldLabel { color: %(muted)s; }
 QLabel#hint { color: %(muted)s; font-size: 12px; }
 QLabel#outputPath { color: %(muted)s; font-size: 12px; }
+QLabel#outputPath[state="warn"] { color: %(danger)s; }
 QLabel#status { color: %(muted)s; }
 QLabel#status[state="ok"] { color: %(success)s; }
 QLabel#status[state="error"] { color: %(danger)s; }
@@ -307,6 +312,13 @@ QLabel#badge {
     font-size: 11px; font-weight: 700; padding: 8px 6px;
 }
 QLabel#selName { font-weight: 600; }
+QFrame#fileRow { background: %(surface_alt)s; border: 1px solid %(border)s; border-radius: 10px; }
+QFrame#fileRow[current="true"] { border: 1px solid %(accent)s; }
+QLabel#rowNumber { color: %(accent)s; font-weight: 700; min-width: 22px; }
+QLabel#folderItem { color: %(muted)s; font-size: 12px; }
+QLabel#folderItem[current="true"] { color: %(accent)s; font-weight: 600; }
+QLineEdit#pagesEdit { padding: 3px 8px; border-radius: 6px; }
+QLineEdit#pagesEdit[invalid="true"] { border: 1px solid %(danger)s; }
 QLabel#selMeta { color: %(muted)s; font-size: 12px; }
 
 QFrame#actionBar { background: %(surface)s; border-top: 1px solid %(border)s; }
@@ -371,23 +383,30 @@ def _apply_palette(app: QApplication, colors: dict) -> None:
 # Preview drawing (Qt) -- same geometry as watermark._draw_watermark_grid
 # ============================================================================
 
-def qfont_for(pdf_font: str) -> QFont:
-    """QFont that looks like a PDF standard font."""
-    base, _, variant = pdf_font.partition("-")
-    font = QFont(base)
-    font.setBold("Bold" in variant)
-    font.setItalic("Oblique" in variant or "Italic" in variant)
-    font.setKerning(False)                      # ReportLab does not kern
-    font.setHintingPreference(QFont.PreferNoHinting)
-    font.setStyleStrategy(QFont.PreferOutline)
-    return font
+_OUTLINE_CACHE: dict = {}
 
 
-def font_display_name(pdf_font: str) -> str:
-    base, _, variant = pdf_font.partition("-")
-    variant = variant.replace("Roman", "").replace("BoldOblique", "Bold Oblique")
-    variant = variant.replace("BoldItalic", "Bold Italic")
-    return f"{base} {variant}".strip()
+def outline_path(style: WatermarkStyle) -> QPainterPath:
+    """Text block of the watermark as a Qt path: the very same outlines as
+    in the PDF (centered on the origin, points, y axis pointing *up*)."""
+    key = (style.font, style.size, tuple(style.lines))
+    path = _OUTLINE_CACHE.get(key)
+    if path is None:
+        path = QPainterPath()
+        path.setFillRule(Qt.WindingFill)
+        for operator, points in text_block_outline(style):
+            if operator == "moveTo":
+                path.moveTo(*points[0])
+            elif operator == "lineTo":
+                path.lineTo(*points[0])
+            elif operator == "curveTo":
+                path.cubicTo(*points[0], *points[1], *points[2])
+            else:
+                path.closeSubpath()
+        if len(_OUTLINE_CACHE) > 32:
+            _OUTLINE_CACHE.clear()
+        _OUTLINE_CACHE[key] = path
+    return path
 
 
 def draw_watermark(
@@ -399,8 +418,8 @@ def draw_watermark(
 ) -> None:
     """Draw the watermark in *page coordinates* (points, origin top-left).
 
-    The caller is responsible for scaling points to pixels. Positions,
-    rotation, line spacing and font size exactly match the PDF output.
+    The caller is responsible for scaling points to pixels. The glyph
+    outlines come from the same font files as the PDF: the preview is exact.
     """
     centers = list(style.cell_centers(width, height))  # validates the margin
 
@@ -420,34 +439,18 @@ def draw_watermark(
             y = inner.top() + j * step_y
             painter.drawLine(QPointF(inner.left(), y), QPointF(inner.right(), y))
 
-    # A large reference size, scaled down per block: avoids integer font
-    # sizes and screen-DPI conversions, so 1 font point == 1 page point.
-    reference = 100.0
-    font = qfont_for(style.font)
-    font.setPixelSize(int(reference))
-    metrics = QFontMetricsF(font)
-
     color = QColor(style.color)
     color.setAlphaF(style.opacity)
-    painter.setPen(color)
-    painter.setFont(font)
+    brush = QBrush(color)
+    path = outline_path(style)
 
-    lines = style.lines
-    widths = [metrics.horizontalAdvance(line) for line in lines]
-    scale = style.size / reference
-    line_height = style.size * LINE_SPACING
-    first_baseline = (len(lines) - 1) * line_height / 2
-
+    painter.setPen(Qt.NoPen)
     for x, y in centers:
         painter.save()
         painter.translate(x, height - y)           # PDF y goes up, Qt y goes down
         painter.rotate(-style.angle)               # PDF angles are counter-clockwise
-        painter.scale(scale, scale)
-        baseline = first_baseline
-        for line, line_width in zip(lines, widths):
-            if line:
-                painter.drawText(QPointF(-line_width / 2, -baseline / scale), line)
-            baseline -= line_height
+        painter.scale(1, -1)                       # the outline's y axis points up
+        painter.fillPath(path, brush)
         painter.restore()
 
 
@@ -831,6 +834,179 @@ class SelectionChip(QFrame):
         self._elide()
 
 
+def repolish(widget: QWidget) -> None:
+    """Re-apply the style sheet after a dynamic property changed."""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+def set_flag(widget: QWidget, name: str, value: bool) -> None:
+    """Set a boolean dynamic property used by the style sheet."""
+    if widget.property(name) != value:
+        widget.setProperty(name, value)
+        repolish(widget)
+
+
+class SourceRenderer:
+    """Renders PDF pages as images (pypdfium2), with a small cache.
+
+    The resolution is rounded up to a power of two, so zooming in re-renders
+    only from time to time, and capped to keep memory reasonable.
+    """
+
+    MAX_SIDE = 4096
+    CACHE_SIZE = 8
+    _FORMATS = {
+        "RGB": QImage.Format_RGB888,
+        "RGBA": QImage.Format_RGBA8888,
+        "RGBX": QImage.Format_RGBX8888,
+        "L": QImage.Format_Grayscale8,
+    }
+
+    def __init__(self):
+        self._cache: "OrderedDict[tuple, QImage]" = OrderedDict()
+
+    @staticmethod
+    def available() -> bool:
+        return pdfium is not None
+
+    def render(self, path: Path, index: int, long_side_px: float) -> QImage:
+        """Page ``index`` (0-based) of ``path`` as displayed by PDF readers
+        (crop box and rotation applied), about ``long_side_px`` pixels long."""
+        if pdfium is None:
+            raise RuntimeError("pypdfium2 is not installed")
+        target = min(self.MAX_SIDE, 2 ** math.ceil(math.log2(max(256.0, long_side_px))))
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        key = (path_key(path), index, mtime, target)
+        image = self._cache.get(key)
+        if image is not None:
+            self._cache.move_to_end(key)
+            return image
+
+        document = pdfium.PdfDocument(str(path))
+        try:
+            page = document[index]
+            width, height = page.get_size()
+            bitmap = page.render(scale=target / max(width, height), rev_byteorder=True)
+            image_format = self._FORMATS[bitmap.mode]
+            image = QImage(bytes(bitmap.buffer), bitmap.width, bitmap.height,
+                           bitmap.stride, image_format).copy()   # own the pixels
+        finally:
+            document.close()
+
+        self._cache[key] = image
+        while len(self._cache) > self.CACHE_SIZE:
+            self._cache.popitem(last=False)
+        return image
+
+
+def set_invalid(edit: QLineEdit, message: Optional[str], tooltip: str) -> None:
+    """Red border + error tooltip on a line edit (``message=None``: valid)."""
+    invalid = message is not None
+    if edit.property("invalid") != invalid:
+        edit.setProperty("invalid", invalid)
+        edit.style().unpolish(edit)
+        edit.style().polish(edit)
+    edit.setToolTip(message if invalid else tooltip)
+
+
+class ElidedLabel(QLabel):
+    """Label shortening its text with "…" in the middle when too narrow."""
+
+    def __init__(self, parent=None, objectName: str = ""):  # noqa: N803 (Qt style)
+        super().__init__(parent, objectName=objectName)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(40)
+        self._full_text = ""
+
+    def setFullText(self, text: str) -> None:  # noqa: N802
+        self._full_text = text
+        self._elide()
+
+    def _elide(self) -> None:
+        width = max(60, self.width())
+        self.setText(self.fontMetrics().elidedText(self._full_text, Qt.ElideMiddle, width))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+
+class FileRow(QFrame):
+    """One selected PDF: name, page count, page selection, remove button."""
+
+    removed = pyqtSignal(object)
+    changed = pyqtSignal()
+
+    def __init__(self, path: Path, parent=None):
+        super().__init__(parent)
+        self.setObjectName("fileRow")
+        self.path = path
+        self.page_count: Optional[int] = None
+        self.page_size: Optional[tuple[float, float]] = None
+        self.read_error: Optional[str] = None
+        try:
+            self.page_count = count_pdf_pages(path)
+            self.page_size = get_page_size(path)
+        except Exception as exc:  # unreadable / password-protected PDF
+            self.read_error = f"{type(exc).__name__}: {exc}"
+
+        self.number = QLabel(objectName="rowNumber")
+        self.name = ElidedLabel(objectName="selName")
+        self.name.setFullText(path.name)
+        self.meta = QLabel(objectName="selMeta")
+        self.pages_label = QLabel(objectName="selMeta")
+        self.pages_edit = QLineEdit(objectName="pagesEdit")
+        self.pages_edit.setMinimumWidth(130)
+        self.pages_edit.textChanged.connect(lambda _text: self.changed.emit())
+        self.remove_button = QToolButton(text="✕", objectName="ghost")
+        self.remove_button.setCursor(Qt.PointingHandCursor)
+        self.remove_button.clicked.connect(lambda: self.removed.emit(self))
+        # Full path on hover (the name, number and row itself).
+        for widget in (self, self.number, self.name):
+            widget.setToolTip(str(path))
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        top.addWidget(self.number)
+        top.addWidget(self.name, 1)
+        top.addWidget(self.remove_button)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(8)
+        bottom.addWidget(self.meta)
+        bottom.addStretch()
+        bottom.addWidget(self.pages_label)
+        bottom.addWidget(self.pages_edit)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 6, 8)
+        layout.setSpacing(4)
+        layout.addLayout(top)
+        layout.addLayout(bottom)
+
+    def set_number(self, number: int) -> None:
+        self.number.setText(f"{number}.")
+
+    def page_selection(self) -> Optional[list[int]]:
+        """1-based pages typed by the user (``None`` = all); raises
+        :class:`PageSelectionError`. Pages beyond the end of the PDF are
+        allowed: they are simply ignored."""
+        return parse_pages(self.pages_edit.text())
+
+    def retranslate(self, t) -> None:
+        if self.page_count is not None:
+            self.meta.setText(t("pages_count", n=self.page_count))
+        else:
+            self.meta.setText("⚠ " + t("unreadable_pdf"))
+        self.meta.setToolTip(f"{self.path}\n{self.read_error}" if self.read_error else str(self.path))
+        self.pages_label.setText(t("pages"))
+        self.pages_edit.setPlaceholderText(t("pages_placeholder"))
+        self.remove_button.setToolTip(t("remove_file"))
+
+
 class PreviewCanvas(QWidget):
     """Draws a page and its watermark, scaled to fit, crisp at any size."""
 
@@ -840,24 +1016,32 @@ class PreviewCanvas(QWidget):
         super().__init__(parent)
         self.setMinimumSize(320, 380)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.page_size = A4
+        self.page_size: Optional[tuple[float, float]] = A4
         self.caption = ""
         self.text = ""
         self.options: dict = {}
         self.guides = False
+        self.source = None            # callable(long_side_px) -> QImage, or None
+        self.watermarked = True       # False: page outside the page selection
         self.empty_message = ""
+        self.no_page_message = ""
         self.error_title = "Error"
+        self.source_error_title = "Error"
         self.zoom = 1.0
         self.pan = QPointF(0, 0)
         self._drag_origin = None
         self.setCursor(Qt.OpenHandCursor)
 
-    def set_config(self, page_size, caption: str, text: str, options: dict, guides: bool) -> None:
+    def set_config(self, page_size, caption: str, text: str, options: dict, guides: bool,
+                   source=None, watermarked: bool = True) -> None:
+        """``page_size=None`` shows no page at all (Auto mode without PDF)."""
         self.page_size = page_size
         self.caption = caption
         self.text = text
         self.options = options
         self.guides = guides
+        self.source = source
+        self.watermarked = watermarked
         self.update()
 
     def _view_center(self) -> QPointF:
@@ -906,6 +1090,13 @@ class PreviewCanvas(QWidget):
                          | QPainter.SmoothPixmapTransform)
         p.fillRect(self.rect(), self.colors["canvas"])
 
+        if self.page_size is None:            # nothing to preview yet
+            p.setPen(self.colors["muted"])
+            p.drawText(QRectF(self.rect()).adjusted(40, 40, -40, -40),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.no_page_message)
+            p.end()
+            return
+
         page_w, page_h = float(self.page_size[0]), float(self.page_size[1])
         pad, caption_h = 28.0, 26.0
         scale = min((self.width() - 2 * pad) / page_w,
@@ -923,6 +1114,16 @@ class PreviewCanvas(QWidget):
         p.setBrush(QColor("white"))
         p.drawRect(page)
 
+        # Content of the PDF page ("show source").
+        source_error = None
+        if self.source is not None:
+            try:
+                ratio = self.devicePixelRatioF()
+                image = self.source(max(page.width(), page.height()) * ratio)
+                p.drawImage(page, image)
+            except Exception as exc:  # unreadable page, password, missing library...
+                source_error = f"{type(exc).__name__}: {exc}"
+
         # Caption under the page.
         p.setPen(self.colors["muted"])
         small = QFont(self.font())
@@ -931,10 +1132,19 @@ class PreviewCanvas(QWidget):
         p.drawText(QRectF(0, page.bottom() + 8, self.width(), caption_h),
                    Qt.AlignHCenter | Qt.AlignTop, self.caption)
 
+        if source_error:
+            p.setPen(QColor("#DC2626"))
+            p.drawText(page.adjusted(24, 24, -24, -24), Qt.AlignTop | Qt.AlignHCenter
+                       | Qt.TextWordWrap, f"{self.source_error_title}\n{source_error}")
+
         if not self.text.strip():
-            p.setPen(QColor("#9CA3AF"))
-            p.drawText(page.adjusted(24, 24, -24, -24), Qt.AlignCenter | Qt.TextWordWrap,
-                       self.empty_message)
+            if self.source is None:
+                p.setPen(QColor("#9CA3AF"))
+                p.drawText(page.adjusted(24, 24, -24, -24), Qt.AlignCenter | Qt.TextWordWrap,
+                           self.empty_message)
+            p.end()
+            return
+        if not self.watermarked and not self.guides:
             p.end()
             return
 
@@ -947,7 +1157,11 @@ class PreviewCanvas(QWidget):
             guides = QColor(self.colors["accent"]) if self.guides else None
             if guides is not None:
                 guides.setAlpha(110)
-            draw_watermark(p, page_w, page_h, style, guides)
+            if self.watermarked:
+                draw_watermark(p, page_w, page_h, style, guides)
+            elif guides is not None:     # page not watermarked: grid only
+                draw_watermark(p, page_w, page_h, style.__class__(
+                    text=style.text, **{**self.options, "opacity": 0.0}), guides)
             error = None
         except Exception as exc:  # invalid settings: show the reason on the page
             error = str(exc)
@@ -966,20 +1180,30 @@ class PreviewCanvas(QWidget):
 # ============================================================================
 
 class WatermarkWorker(QThread):
-    """Run the generation in a background thread."""
+    """Run the generation in a background thread.
+
+    ``kind="files"``: ``files`` maps each PDF to its 0-based page indices
+    (``None`` = all). ``kind="folder"``: every PDF of ``folder`` gets
+    ``pages``.
+    """
 
     progress = pyqtSignal(int, int, str)
-    completed = pyqtSignal(str, object)  # status: "ok" | "cancelled" | "error", payload
+    # status: "ok" | "exists" | "cancelled" | "error", payload
+    completed = pyqtSignal(str, object)
 
-    def __init__(self, kind: str, path: Path, text: str, suffix: str,
-                 recursive: bool, options: dict, parent=None):
+    def __init__(self, kind: str, text: str, suffix: str, overwrite: bool, options: dict,
+                 files: Optional[dict] = None, folder: Optional[Path] = None,
+                 pages: Optional[list[int]] = None, recursive: bool = False, parent=None):
         super().__init__(parent)
         self.kind = kind
-        self.path = path
         self.text = text
         self.suffix = suffix
-        self.recursive = recursive
+        self.overwrite = overwrite
         self.options = options
+        self.files = files or {}
+        self.folder = folder
+        self.pages = pages
+        self.recursive = recursive
         self._cancel = threading.Event()
         self._last_emit = 0.0
 
@@ -993,23 +1217,24 @@ class WatermarkWorker(QThread):
             self.progress.emit(done, total, name)
 
     def run(self) -> None:
+        common = dict(
+            suffix=self.suffix, overwrite=self.overwrite, verbose=False,
+            progress_callback=self._on_progress, cancel_event=self._cancel,
+            **self.options,
+        )
         try:
-            if self.kind == "file":
-                output = add_watermark(
-                    self.path, self.text, suffix=self.suffix, verbose=False,
-                    progress_callback=self._on_progress, cancel_event=self._cancel,
-                    **self.options,
-                )
-                results = {str(self.path): output}
+            if self.kind == "files":
+                results = watermark_files(self.files, self.text, **common)
             else:
                 results = batch_watermark_directory(
-                    self.path, self.text, suffix=self.suffix, recursive=self.recursive,
-                    verbose=False, progress_callback=self._on_progress,
-                    cancel_event=self._cancel, **self.options,
+                    self.folder, self.text, recursive=self.recursive, pages=self.pages,
+                    **common,
                 )
             self.completed.emit("ok", results)
         except WatermarkCancelled:
             self.completed.emit("cancelled", None)
+        except DestinationExistsError as exc:   # created after the check
+            self.completed.emit("exists", exc.paths)
         except Exception as exc:
             self.completed.emit("error", f"{type(exc).__name__}: {exc}")
 
@@ -1028,13 +1253,24 @@ class WatermarkWindow(QMainWindow):
         self.language = self._initial_language()
         self.theme = "light"
 
-        self.input_kind: Optional[str] = None       # None | "file" | "folder"
-        self.input_path: Optional[Path] = None
-        self.auto_page_size: Optional[tuple[float, float]] = None
+        self.input_kind: Optional[str] = None       # None | "files" | "folder"
+        self.input_path: Optional[Path] = None      # folder mode only
+        self.file_rows: list[FileRow] = []          # files mode only
+        self.folder_files: list[Path] = []          # folder mode only
+
+        # Preview (Auto mode): the previewed PDF is tracked by its path key, so
+        # it stays the same when other PDFs are added or removed.
+        self.renderer = SourceRenderer()
+        self.preview_key: Optional[str] = None
+        self._preview_page_key: Optional[str] = None   # PDF the page spin refers to
+        self._doc_cache: dict = {}                     # (key, mtime) -> page count
+        self._size_cache: dict = {}                    # (key, mtime, index) -> size
+        self._syncing = False
         self.last_output_dir: Optional[Path] = None
         self.worker: Optional[WatermarkWorker] = None
         self._status_key = ("status_ready", {})
         self._browse_dir = str(Path.home())         # remembered for this session only
+        self._font_dir = self._default_font_dir()
 
         self.setWindowIcon(_make_app_icon())
         self.setAcceptDrops(True)
@@ -1065,8 +1301,8 @@ class WatermarkWindow(QMainWindow):
     # ==================================================================
 
     def _build_ui(self) -> None:
-        self.setMinimumSize(995, 650)
-        self.resize(1050, 700)
+        self.setMinimumSize(1045, 650)
+        self.resize(1100, 700)
 
         root = QWidget(objectName="root")
         self.setCentralWidget(root)
@@ -1088,7 +1324,7 @@ class WatermarkWindow(QMainWindow):
         splitter.addWidget(self._build_preview_card())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([400, 820])
+        splitter.setSizes([450, 820])
         body_layout.addWidget(splitter, 1)
 
         self.log = QPlainTextEdit(objectName="log")
@@ -1101,7 +1337,7 @@ class WatermarkWindow(QMainWindow):
         root_layout.addWidget(self._build_action_bar())
 
         QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.start_generation)
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.select_file)
+        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.select_files)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.cancel_generation)
 
     # ------------------------------------------------------------------
@@ -1124,17 +1360,19 @@ class WatermarkWindow(QMainWindow):
         layout.addLayout(titles)
         layout.addStretch()
 
+        # The updates button (text length depends on the language) is on the
+        # left of the language list, so the list does not move when switching.
+        self.update_button = QPushButton(objectName="ghost")
+        self.update_button.setCursor(Qt.PointingHandCursor)
+        self.update_button.clicked.connect(self.show_updates)
+        layout.addWidget(self.update_button)
+
         self.language_combo = QComboBox()
         for label, code in LANGUAGES.items():
             self.language_combo.addItem(label, code)
         self.language_combo.setCurrentIndex(max(0, self.language_combo.findData(self.language)))
         self.language_combo.currentIndexChanged.connect(self._language_changed)
         layout.addWidget(self.language_combo)
-
-        self.update_button = QPushButton(objectName="ghost")
-        self.update_button.setCursor(Qt.PointingHandCursor)
-        self.update_button.clicked.connect(self.show_updates)
-        layout.addWidget(self.update_button)
 
         self.theme_button = QToolButton(objectName="ghost")
         self.theme_button.setCursor(Qt.PointingHandCursor)
@@ -1148,8 +1386,8 @@ class WatermarkWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(370)
-        scroll.setMaximumWidth(480)
+        scroll.setMinimumWidth(420)
+        scroll.setMaximumWidth(530)
 
         inner = QWidget(objectName="scrollInner")
         layout = QVBoxLayout(inner)
@@ -1180,11 +1418,19 @@ class WatermarkWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
 
         self.font_combo = QComboBox()
-        for name in STANDARD_FONTS:
-            self.font_combo.addItem(font_display_name(name), name)
-            preview_font = qfont_for(name)
-            preview_font.setPointSize(10)
-            self.font_combo.setItemData(self.font_combo.count() - 1, preview_font, Qt.FontRole)
+        self.font_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.font_combo.setMinimumContentsLength(12)
+        self._populate_fonts()
+        self.add_font_button = QPushButton("+")
+        self.add_font_button.setFixedWidth(36)
+        self.add_font_button.setCursor(Qt.PointingHandCursor)
+        self.add_font_button.clicked.connect(self.add_font)
+        self.font_box = QWidget()
+        font_layout = QHBoxLayout(self.font_box)
+        font_layout.setContentsMargins(0, 0, 0, 0)
+        font_layout.setSpacing(6)
+        font_layout.addWidget(self.font_combo, 1)
+        font_layout.addWidget(self.add_font_button)
 
         self.size_spin = QDoubleSpinBox()
         self.size_spin.setRange(4, 300)
@@ -1204,7 +1450,7 @@ class WatermarkWindow(QMainWindow):
         self.angle_label = QLabel(objectName="fieldLabel")
 
         rows = [
-            (self.font_label, self.font_combo),
+            (self.font_label, self.font_box),
             (self.size_label, self.size_stepper),
             (self.color_label, self.color_picker),
             (self.opacity_label, self.opacity_slider),
@@ -1249,10 +1495,36 @@ class WatermarkWindow(QMainWindow):
         # --- Files -----------------------------------------------------
         self.files_card = Card()
         self.drop_zone = DropZone()
-        self.drop_zone.file_button.clicked.connect(self.select_file)
+        self.drop_zone.file_button.clicked.connect(self.select_files)
         self.drop_zone.folder_button.clicked.connect(self.select_folder)
+
+        # Files mode: one row per PDF, each with its own page selection.
+        self.file_list = QWidget()
+        self.file_list_layout = QVBoxLayout(self.file_list)
+        self.file_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.file_list_layout.setSpacing(6)
+
+        # Folder mode: one folder, one page selection for every PDF.
         self.selection_chip = SelectionChip()
         self.selection_chip.cleared.connect(self.clear_selection)
+        self.folder_list = QWidget()
+        self.folder_list_layout = QVBoxLayout(self.folder_list)
+        self.folder_list_layout.setContentsMargins(10, 0, 4, 0)
+        self.folder_list_layout.setSpacing(2)
+        self.folder_pages = QWidget()
+        folder_pages_layout = QGridLayout(self.folder_pages)
+        folder_pages_layout.setContentsMargins(0, 0, 0, 0)
+        folder_pages_layout.setHorizontalSpacing(10)
+        folder_pages_layout.setVerticalSpacing(2)
+        self.folder_pages_label = QLabel(objectName="fieldLabel")
+        self.folder_pages_edit = QLineEdit(objectName="pagesEdit")
+        self.folder_pages_edit.textChanged.connect(self._pages_changed)
+        self.folder_pages_hint = QLabel(objectName="hint")
+        self.folder_pages_hint.setWordWrap(True)
+        folder_pages_layout.addWidget(self.folder_pages_label, 0, 0)
+        folder_pages_layout.addWidget(self.folder_pages_edit, 0, 1)
+        folder_pages_layout.addWidget(self.folder_pages_hint, 1, 1)
+        folder_pages_layout.setColumnStretch(1, 1)
         self.recursive_switch = ToggleSwitch()
         self.recursive_switch.toggled.connect(self._refresh_selection)
 
@@ -1260,18 +1532,25 @@ class WatermarkWindow(QMainWindow):
         suffix_row.setSpacing(10)
         self.suffix_label = QLabel(objectName="fieldLabel")
         self.suffix_edit = QLineEdit()
-        self.suffix_edit.textChanged.connect(self._update_output_label)
+        self.suffix_edit.textChanged.connect(self._suffix_changed)
         suffix_row.addWidget(self.suffix_label)
         suffix_row.addWidget(self.suffix_edit, 1)
+
+        self.overwrite_switch = ToggleSwitch()
+        self.overwrite_switch.toggled.connect(self._update_output_label)
 
         self.output_label = QLabel(objectName="outputPath")
         self.output_label.setWordWrap(True)
         self.output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         self.files_card.body.addWidget(self.drop_zone)
+        self.files_card.body.addWidget(self.file_list)
         self.files_card.body.addWidget(self.selection_chip)
+        self.files_card.body.addWidget(self.folder_list)
+        self.files_card.body.addWidget(self.folder_pages)
         self.files_card.body.addWidget(self.recursive_switch)
         self.files_card.body.addLayout(suffix_row)
+        self.files_card.body.addWidget(self.overwrite_switch)
         self.files_card.body.addWidget(self.output_label)
         layout.addWidget(self.files_card)
 
@@ -1316,6 +1595,30 @@ class WatermarkWindow(QMainWindow):
         header.addLayout(orientation)
         header.addSpacing(10)
         header.addWidget(self.guides_switch)
+
+        # Auto mode only: which PDF / page, and its content behind the watermark.
+        self.preview_doc_label = QLabel(objectName="fieldLabel")
+        self.preview_doc_spin = QSpinBox()
+        self.preview_doc_stepper = Stepper(self.preview_doc_spin)
+        self.preview_doc_stepper.setFixedWidth(120)
+        self.source_switch = ToggleSwitch()
+        self.preview_page_label = QLabel(objectName="fieldLabel")
+        self.preview_page_spin = QSpinBox()
+        self.preview_page_stepper = Stepper(self.preview_page_spin)
+        self.preview_page_stepper.setFixedWidth(120)
+        self.auto_controls = QWidget()
+        auto_layout = QHBoxLayout(self.auto_controls)
+        auto_layout.setContentsMargins(0, 0, 0, 0)
+        auto_layout.setSpacing(8)
+        auto_layout.addWidget(self.preview_doc_label)
+        auto_layout.addWidget(self.preview_doc_stepper)
+        auto_layout.addSpacing(14)
+        auto_layout.addWidget(self.source_switch)
+        auto_layout.addSpacing(14)
+        auto_layout.addWidget(self.preview_page_label)
+        auto_layout.addWidget(self.preview_page_stepper)
+        auto_layout.addStretch()
+        self.preview_card.body.addWidget(self.auto_controls)
 
         self.canvas = PreviewCanvas()
         canvas_frame = QFrame()
@@ -1382,6 +1685,9 @@ class WatermarkWindow(QMainWindow):
         self.margin_spin.valueChanged.connect(self._refresh_preview)
         self.orientation_group.buttonClicked.connect(self._refresh_preview)
         self.guides_switch.toggled.connect(self._refresh_preview)
+        self.preview_doc_spin.valueChanged.connect(self._preview_doc_changed)
+        self.preview_page_spin.valueChanged.connect(self._preview_page_changed)
+        self.source_switch.toggled.connect(self._source_toggled)
 
     # ==================================================================
     # Theme & language
@@ -1442,6 +1748,7 @@ class WatermarkWindow(QMainWindow):
         self.reset_button.setText(t("reset"))
         self.reset_button.setToolTip(t("reset_tip"))
         self.font_label.setText(t("font"))
+        self.add_font_button.setToolTip(t("add_font"))
         self.size_label.setText(t("font_size"))
         self.color_label.setText(t("color"))
         self.color_picker.custom_title = t("custom_color")
@@ -1457,13 +1764,21 @@ class WatermarkWindow(QMainWindow):
         self.files_card.setTitle(t("files_card"))
         self.drop_zone.title.setText(t("drop_title"))
         self.drop_zone.or_label.setText(t("drop_or"))
-        self.drop_zone.file_button.setText(t("browse_file"))
+        self.drop_zone.file_button.setText(t("browse_files"))
         self.drop_zone.folder_button.setText(t("browse_folder"))
         self.selection_chip.clear_button.setToolTip(t("clear_selection"))
+        for row in self.file_rows:
+            row.retranslate(t)
+        self.folder_pages_label.setText(t("pages"))
+        self.folder_pages_edit.setPlaceholderText(t("pages_placeholder"))
+        self.folder_pages_hint.setText(t("folder_pages_hint"))
         self.recursive_switch.setText(t("include_subfolders"))
         self.recursive_switch.updateGeometry()
         self.suffix_label.setText(t("suffix"))
         self.suffix_edit.setPlaceholderText(t("suffix_placeholder"))
+        self.overwrite_switch.setText(t("overwrite"))
+        self.overwrite_switch.setToolTip(t("overwrite_tip"))
+        self.overwrite_switch.updateGeometry()
 
         self.preview_card.setTitle(t("preview"))
         self.page_label.setText(t("page_size"))
@@ -1472,8 +1787,15 @@ class WatermarkWindow(QMainWindow):
         self.landscape_button.setText(t("landscape"))
         self.guides_switch.setText(t("guides"))
         self.guides_switch.updateGeometry()
+        self.preview_doc_label.setText(t("preview_pdf"))
+        self.source_switch.setText(t("show_source"))
+        self.source_switch.updateGeometry()
+        self.source_switch.setToolTip("" if SourceRenderer.available() else t("source_missing"))
+        self.preview_page_label.setText(t("preview_page"))
         self.canvas.empty_message = t("preview_no_text")
+        self.canvas.no_page_message = t("preview_no_pdf")
         self.canvas.error_title = t("preview_error")
+        self.canvas.source_error_title = t("source_error")
 
         self.log_button.setText(t("log_show"))
         self.open_button.setText(t("open_output"))
@@ -1493,6 +1815,7 @@ class WatermarkWindow(QMainWindow):
         """Initial state of the controls (no settings are saved between runs)."""
         self._reset_style()
         self.suffix_edit.setText(self._t("default_suffix"))
+        self.overwrite_switch.setChecked(False)
         self.page_combo.setCurrentIndex(max(0, self.page_combo.findData("auto")))
         self.portrait_button.setChecked(True)
         self._page_combo_changed()
@@ -1511,40 +1834,135 @@ class WatermarkWindow(QMainWindow):
     # Input selection
     # ==================================================================
 
-    def select_file(self) -> None:
+    # ------------------------------------------------------------------
+    # Fonts
+    # ------------------------------------------------------------------
+
+    def _populate_fonts(self, select: Optional[str] = None) -> None:
+        """Fill the font list (bundled fonts, then the ones added)."""
+        current = select or self.font_combo.currentData() or DEFAULTS["font"]
+        self.font_combo.blockSignals(True)
+        self.font_combo.clear()
+        for name in available_fonts():
+            self.font_combo.addItem(name, name)
+        self.font_combo.setCurrentIndex(max(0, self.font_combo.findData(current)))
+        self.font_combo.blockSignals(False)
+
+    @staticmethod
+    def _default_font_dir() -> str:
+        """First existing fonts folder of the system, else the home folder."""
+        for location in QStandardPaths.standardLocations(QStandardPaths.FontsLocation):
+            if location and Path(location).is_dir():
+                return location
+        return str(Path.home())
+
+    @staticmethod
+    def _register_font(path: Path) -> str:
+        """Register a font file under its file name, "<name> (2)"... when a
+        different font already uses that name. Nothing is saved: added fonts
+        are available until the application is closed."""
+        base = path.stem
+        for name in [base] + [f"{base} ({i})" for i in range(2, 100)]:
+            try:
+                return register_font(path, name)
+            except ValueError:
+                if name in available_fonts():
+                    continue        # name used by another font file
+                raise               # unreadable font
+        raise ValueError(f"Too many fonts named {base!r}.")
+
+    def add_font(self) -> None:
         file_name, _ = QFileDialog.getOpenFileName(
+            self, self._t("select_font"), self._font_dir, self._t("font_filter"))
+        if not file_name:
+            return
+        path = Path(file_name)
+        self._font_dir = str(path.parent)
+        try:
+            name = self._register_font(path)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, self._t("title"), self._t("err_font", error=str(exc)))
+            return
+        self._populate_fonts(select=name)
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+    # Files / folder
+    # ------------------------------------------------------------------
+
+    def select_files(self) -> None:
+        file_names, _ = QFileDialog.getOpenFileNames(
             self, self._t("select_pdf"), self._browse_dir, self._t("pdf_filter"))
-        if file_name:
-            self.set_input(Path(file_name))
+        if file_names:
+            self.add_files([Path(name) for name in file_names])
 
     def select_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(
             self, self._t("select_folder_dialog"), self._browse_dir)
         if directory:
-            self.set_input(Path(directory))
+            self.set_folder(Path(directory))
 
-    def set_input(self, path: Path) -> None:
-        if path.is_dir():
-            self.input_kind = "folder"
-            self._browse_dir = str(path)
-        elif path.is_file() and path.suffix.lower() == ".pdf":
-            self.input_kind = "file"
-            self._browse_dir = str(path.parent)
-        else:
+    def add_files(self, paths: list[Path]) -> None:
+        """Add PDFs to the list (switches to files mode; duplicates ignored)."""
+        pdfs = [p for p in paths if p.is_file() and p.suffix.lower() == ".pdf"]
+        if not pdfs or self._is_running():
             return
+        if self.input_kind == "folder":
+            self._clear_inputs()
+        known = {path_key(row.path) for row in self.file_rows}
+        for path in pdfs:
+            key = path_key(path)
+            if key in known:
+                continue
+            known.add(key)
+            row = FileRow(path)
+            row.retranslate(self._t)
+            row.removed.connect(self.remove_file)
+            row.changed.connect(self._pages_changed)
+            self.file_rows.append(row)
+            self.file_list_layout.addWidget(row)
+        self.input_kind = "files"
+        self._browse_dir = str(pdfs[-1].parent)
+        self._inputs_changed()
+
+    def set_folder(self, path: Path) -> None:
+        """Select a folder (replaces the current selection)."""
+        if not path.is_dir() or self._is_running():
+            return
+        self._clear_inputs()
+        self.input_kind = "folder"
         self.input_path = path
+        self._browse_dir = str(path)
+        self._inputs_changed()
+
+    def remove_file(self, row: "FileRow") -> None:
+        if row in self.file_rows and not self._is_running():
+            self.file_rows.remove(row)
+            self.file_list_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+            if not self.file_rows:
+                self.input_kind = None
+            self._inputs_changed()
+
+    def clear_selection(self) -> None:
+        self._clear_inputs()
+        self._inputs_changed()
+
+    def _clear_inputs(self) -> None:
+        for row in self.file_rows:
+            self.file_list_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+        self.file_rows = []
+        self.input_kind = None
+        self.input_path = None
+
+    def _inputs_changed(self) -> None:
         self.last_output_dir = None
         self.open_button.setEnabled(False)
         self.canvas.reset_view()
         self._refresh_selection()
-        self._refresh_preview()
-
-    def clear_selection(self) -> None:
-        self.input_kind = None
-        self.input_path = None
-        self.auto_page_size = None
-        self._refresh_selection()
-        self._refresh_preview()
 
     def _folder_pdfs(self) -> list[Path]:
         if self.input_kind != "folder" or self.input_path is None:
@@ -1561,72 +1979,181 @@ class WatermarkWindow(QMainWindow):
             return []
 
     def _refresh_selection(self, *_args) -> None:
-        """Update the selection chip, the auto page size and the output path."""
-        has_input = self.input_path is not None
-        self.selection_chip.setVisible(has_input)
-        self.recursive_switch.setVisible(self.input_kind == "folder")
-        self.auto_page_size = None
+        """Update the visible widgets, the auto page size and the output path."""
+        kind = self.input_kind
+        self.file_list.setVisible(kind == "files")
+        self.selection_chip.setVisible(kind == "folder")
+        self.folder_list.setVisible(kind == "folder")
+        self.folder_pages.setVisible(kind == "folder")
+        self.recursive_switch.setVisible(kind == "folder")
 
-        if self.input_kind == "file" and self.input_path is not None:
-            try:
-                pages = count_pdf_pages(self.input_path)
-                meta = self._t("pages_count", n=pages)
-                self.auto_page_size = get_page_size(self.input_path)
-            except Exception as exc:
-                meta = f"⚠ {type(exc).__name__}"
-            self.selection_chip.set_content("PDF", self.input_path.name, meta, str(self.input_path))
+        for number, row in enumerate(self.file_rows, start=1):
+            row.set_number(number)
 
-        elif self.input_kind == "folder" and self.input_path is not None:
-            pdfs = self._folder_pdfs()
-            meta = self._t("pdf_count", n=len(pdfs))
-            for pdf in pdfs[:3]:          # first readable PDF gives the page size
-                try:
-                    self.auto_page_size = get_page_size(pdf)
-                    break
-                except Exception:
-                    continue
+        self.folder_files = self._folder_pdfs() if kind == "folder" else []
+        if kind == "folder" and self.input_path is not None:
+            meta = self._t("pdf_count", n=len(self.folder_files))
             self.selection_chip.set_content("DIR", self.input_path.name + "/", meta,
                                             str(self.input_path))
+        self._rebuild_folder_list()
 
+        self._validate_pages()
         self._update_output_label()
+        self._sync_preview_controls()
         self._refresh_preview()
 
-    def _output_location(self) -> Optional[Path]:
+    FOLDER_LIST_MAX = 300
+
+    def _rebuild_folder_list(self) -> None:
+        """Numbered list of the PDFs of the folder (full path on hover)."""
+        while self.folder_list_layout.count():
+            item = self.folder_list_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._folder_labels: list[QLabel] = []
+        base = self.input_path
+        for number, pdf in enumerate(self.folder_files[:self.FOLDER_LIST_MAX], start=1):
+            try:
+                shown = str(pdf.relative_to(base)) if base is not None else pdf.name
+            except ValueError:
+                shown = pdf.name
+            line = QWidget()
+            layout = QHBoxLayout(line)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+            number_label = QLabel(f"{number}.", objectName="rowNumber")
+            name = ElidedLabel(objectName="folderItem")
+            name.setFullText(shown)
+            for widget in (line, number_label, name):
+                widget.setToolTip(str(pdf))
+            layout.addWidget(number_label)
+            layout.addWidget(name, 1)
+            self.folder_list_layout.addWidget(line)
+            self._folder_labels.append(name)
+        hidden = len(self.folder_files) - self.FOLDER_LIST_MAX
+        if hidden > 0:
+            more = QLabel(self._t("folder_more", n=hidden), objectName="hint")
+            self.folder_list_layout.addWidget(more)
+
+    def _suffix_changed(self, *_args) -> None:
+        # In folder mode the suffix filters out the outputs of a previous run.
+        if self.input_kind == "folder":
+            self._refresh_selection()
+        else:
+            self._update_output_label()
+
+    def _pages_changed(self, *_args) -> None:
+        self._validate_pages()
+        self._refresh_preview()       # the previewed page may (no longer) be selected
+
+    # ------------------------------------------------------------------
+    # Page selections
+    # ------------------------------------------------------------------
+
+    def _page_error(self, exc: PageSelectionError) -> str:
+        return self._t(f"page_err_{exc.code}", **exc.details)
+
+    def _validate_pages(self, *_args) -> list[tuple[str, str]]:
+        """Check every page selection, flag the invalid fields and return
+        ``[(file or folder name, error message), ...]``."""
+        errors = []
+        tip = self._t("pages_tip")
+        if self.input_kind == "files":
+            for row in self.file_rows:
+                try:
+                    row.page_selection()
+                    set_invalid(row.pages_edit, None, tip)
+                except PageSelectionError as exc:
+                    message = self._page_error(exc)
+                    set_invalid(row.pages_edit, message, tip)
+                    errors.append((row.path.name, message))
+        elif self.input_kind == "folder" and self.input_path is not None:
+            try:
+                parse_pages(self.folder_pages_edit.text())
+                set_invalid(self.folder_pages_edit, None, tip)
+            except PageSelectionError as exc:
+                message = self._page_error(exc)
+                set_invalid(self.folder_pages_edit, message, tip)
+                errors.append((self.input_path.name + "/", message))
+        return errors
+
+    # ------------------------------------------------------------------
+    # Destinations
+    # ------------------------------------------------------------------
+
+    def _destinations(self) -> list[Path]:
+        """Output files (files mode) or output folder (folder mode)."""
         suffix = self.suffix_edit.text().strip()
-        if self.input_kind == "file" and self.input_path is not None:
-            return self.input_path.with_name(f"{self.input_path.stem}{suffix}{self.input_path.suffix}")
+        if self.input_kind == "files":
+            return [row.path.with_name(f"{row.path.stem}{suffix}{row.path.suffix}")
+                    for row in self.file_rows]
         if self.input_kind == "folder" and self.input_path is not None:
-            return self.input_path.with_name(f"{self.input_path.name}{suffix}")
+            return [self.input_path.with_name(f"{self.input_path.name}{suffix}")]
+        return []
+
+    def _existing_destinations(self) -> list[Path]:
+        return [path for path in self._destinations() if os.path.lexists(path)]
+
+    def _output_location(self) -> Optional[Path]:
+        """Output folder in folder mode."""
+        if self.input_kind == "folder":
+            destinations = self._destinations()
+            return destinations[0] if destinations else None
         return None
 
     def _update_output_label(self, *_args) -> None:
-        location = self._output_location()
-        if location is None:
-            self.output_label.setText(self._t("no_selection_yet"))
+        destinations = self._destinations()
+        state = ""
+        if not destinations:
+            text = self._t("no_selection_yet")
         else:
-            shown = f"{location}{'/' if self.input_kind == 'folder' else ''}"
+            if self.input_kind == "folder":
+                shown = f"{destinations[0]}/"
+            elif len(destinations) == 1:
+                shown = str(destinations[0])
+            else:
+                shown = self._t("output_many", n=len(destinations),
+                                suffix=self.suffix_edit.text().strip())
             # Zero-width spaces let long paths wrap after each separator.
             shown = shown.replace("/", "/\u200b").replace("\\", "\\\u200b")
-            self.output_label.setText(f"{self._t('output_to')} → {shown}")
+            text = f"{self._t('output_to')} → {shown}"
+            existing = self._existing_destinations()
+            replaced_folder = (self.input_kind == "folder"
+                               and existing and existing[0] != self.input_path)
+            if existing and self.overwrite_switch.isChecked():
+                text += "\n" + (self._t("output_folder_replaced") if replaced_folder
+                                else self._t("output_will_overwrite", n=len(existing)))
+            elif existing:
+                text += "\n⚠ " + self._t("output_exists", n=len(existing))
+                state = "warn"
+        self.output_label.setText(text)
+        if self.output_label.property("state") != state:
+            self.output_label.setProperty("state", state)
+            self.output_label.style().unpolish(self.output_label)
+            self.output_label.style().polish(self.output_label)
 
     # ------------------------------------------------------------------
     # Drag & drop
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _dropped_path(event) -> Optional[Path]:
+    def _dropped_paths(event) -> tuple[list[Path], list[Path]]:
+        """``(pdf files, folders)`` dropped."""
+        files, folders = [], []
         mime = event.mimeData()
-        if not mime.hasUrls():
-            return None
-        for url in mime.urls():
-            if url.isLocalFile():
-                path = Path(url.toLocalFile())
-                if path.is_dir() or path.suffix.lower() == ".pdf":
-                    return path
-        return None
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = Path(url.toLocalFile())
+                    if path.is_dir():
+                        folders.append(path)
+                    elif path.suffix.lower() == ".pdf":
+                        files.append(path)
+        return files, folders
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if self._dropped_path(event) is not None and not self._is_running():
+        files, folders = self._dropped_paths(event)
+        if (files or folders) and not self._is_running():
             event.acceptProposedAction()
             self.drop_zone.setActive(True)
         else:
@@ -1637,10 +2164,13 @@ class WatermarkWindow(QMainWindow):
 
     def dropEvent(self, event) -> None:  # noqa: N802
         self.drop_zone.setActive(False)
-        path = self._dropped_path(event)
-        if path is not None:
+        files, folders = self._dropped_paths(event)
+        if files:                       # PDFs win over folders in a mixed drop
             event.acceptProposedAction()
-            self.set_input(path)
+            self.add_files(files)
+        elif folders:                   # a single folder at a time
+            event.acceptProposedAction()
+            self.set_folder(folders[0])
 
     # ==================================================================
     # Preview
@@ -1650,7 +2180,9 @@ class WatermarkWindow(QMainWindow):
         is_auto = self.page_combo.currentData() == "auto"
         self.portrait_button.setEnabled(not is_auto)
         self.landscape_button.setEnabled(not is_auto)
+        self.auto_controls.setVisible(is_auto)
         self.canvas.reset_view()
+        self._sync_preview_controls()
         self._refresh_preview()
 
     def _get_options(self) -> dict:
@@ -1665,10 +2197,178 @@ class WatermarkWindow(QMainWindow):
             "size": float(self.size_spin.value()),
         }
 
-    def _preview_page(self) -> tuple[tuple[float, float], str]:
+    # ------------------------------------------------------------------
+    # Previewed PDF and page (Auto mode)
+    # ------------------------------------------------------------------
+
+    def _preview_documents(self) -> list[Path]:
+        """PDFs that can be previewed, numbered from 1 as in the Files card."""
+        if self.input_kind == "files":
+            return [row.path for row in self.file_rows]
+        if self.input_kind == "folder":
+            return list(self.folder_files)
+        return []
+
+    def _preview_document(self) -> tuple[Optional[int], Optional[Path]]:
+        """``(number, path)`` of the previewed PDF, ``(None, None)`` if none."""
+        documents = self._preview_documents()
+        for number, path in enumerate(documents, start=1):
+            if path_key(path) == self.preview_key:
+                return number, path
+        return None, None
+
+    @staticmethod
+    def _mtime(path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def _page_count(self, path: Path) -> Optional[int]:
+        """Number of pages, ``None`` if the PDF cannot be read (cached)."""
+        for row in self.file_rows:
+            if row.path == path:
+                return row.page_count
+        key = (path_key(path), self._mtime(path))
+        if key not in self._doc_cache:
+            try:
+                self._doc_cache[key] = count_pdf_pages(path)
+            except Exception:
+                self._doc_cache[key] = None
+        return self._doc_cache[key]
+
+    def _page_size(self, path: Path, index: int) -> Optional[tuple[float, float]]:
+        """Displayed size of a page, ``None`` if unreadable (cached)."""
+        key = (path_key(path), self._mtime(path), index)
+        if key not in self._size_cache:
+            try:
+                self._size_cache[key] = get_page_size(path, index)
+            except Exception:
+                self._size_cache[key] = None
+        return self._size_cache[key]
+
+    def _page_selection_of(self, path: Path) -> Optional[list[int]]:
+        """1-based page selection that applies to ``path`` (``None`` = all,
+        also used while the typed selection is invalid)."""
+        try:
+            if self.input_kind == "files":
+                for row in self.file_rows:
+                    if row.path == path:
+                        return row.page_selection()
+            elif self.input_kind == "folder":
+                return parse_pages(self.folder_pages_edit.text())
+        except PageSelectionError:
+            pass
+        return None
+
+    def _source_shown(self) -> bool:
+        return (self.page_combo.currentData() == "auto"
+                and self.source_switch.isChecked()
+                and self.preview_page_spin.isEnabled())
+
+    @staticmethod
+    def _set_spin(spin: QSpinBox, stepper: QWidget, maximum: Optional[int], value: int) -> None:
+        """``maximum=None``: empty and disabled; otherwise range 1..maximum."""
+        if maximum is None:
+            spin.setSpecialValueText(" ")          # shown for the minimum: blank
+            spin.setRange(0, 0)
+            spin.setValue(0)
+            stepper.setEnabled(False)
+        else:
+            spin.setSpecialValueText("")
+            spin.setRange(1, maximum)
+            spin.setValue(min(max(1, value), maximum))
+            stepper.setEnabled(True)
+
+    def _sync_preview_controls(self) -> None:
+        """Keep the PDF / page numbers consistent with the current selection:
+        the same PDF stays previewed when others are added or removed; if it
+        was removed, the first PDF is used; without PDF, both are empty."""
+        if not hasattr(self, "preview_doc_spin"):
+            return
+        self._syncing = True
+        try:
+            documents = self._preview_documents()
+            keys = [path_key(path) for path in documents]
+            if not documents:
+                self.preview_key = None
+                self._set_spin(self.preview_doc_spin, self.preview_doc_stepper, None, 0)
+            else:
+                if self.preview_key not in keys:
+                    self.preview_key = keys[0]
+                number = keys.index(self.preview_key) + 1
+                self._set_spin(self.preview_doc_spin, self.preview_doc_stepper,
+                               len(documents), number)
+
+            self.source_switch.setEnabled(bool(documents) and SourceRenderer.available())
+
+            count = None
+            if documents and self.source_switch.isChecked() and SourceRenderer.available():
+                count = self._page_count(documents[keys.index(self.preview_key)])
+            if count:
+                page = self.preview_page_spin.value()
+                if self._preview_page_key != self.preview_key:
+                    page = 1                       # another PDF: back to page 1
+                self._set_spin(self.preview_page_spin, self.preview_page_stepper, count, page)
+                self._preview_page_key = self.preview_key
+            else:
+                self._set_spin(self.preview_page_spin, self.preview_page_stepper, None, 0)
+                self._preview_page_key = None
+
+            # Highlight the previewed PDF in the Files card.
+            for row, key in zip(self.file_rows, keys if self.input_kind == "files" else []):
+                set_flag(row, "current", key == self.preview_key)
+            for label, key in zip(getattr(self, "_folder_labels", []),
+                                  keys if self.input_kind == "folder" else []):
+                set_flag(label, "current", key == self.preview_key)
+        finally:
+            self._syncing = False
+
+    def _preview_doc_changed(self, value: int) -> None:
+        if self._syncing:
+            return
+        documents = self._preview_documents()
+        if 1 <= value <= len(documents):
+            self.preview_key = path_key(documents[value - 1])
+            self.canvas.reset_view()
+        self._sync_preview_controls()
+        self._refresh_preview()
+
+    def _preview_page_changed(self, _value: int) -> None:
+        if not self._syncing:
+            self._refresh_preview()
+
+    def _source_toggled(self, _checked: bool) -> None:
+        self._sync_preview_controls()
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+
+    def _preview_page(self):
+        """``(page size or None, caption, source, watermarked)``."""
         choice = self.page_combo.currentData()
+        source = None
+        watermarked = True
+        prefix = ""
+
         if choice == "auto":
-            size = self.auto_page_size or A4
+            number, path = self._preview_document()
+            if path is None:
+                return None, "", None, True          # Auto without PDF: no preview
+            prefix = f"{number}. {path.name} · "
+            if self._source_shown():
+                page = self.preview_page_spin.value()
+                count = self._page_count(path)
+                size = self._page_size(path, page - 1)
+                renderer = self.renderer
+                source = lambda px, p=path, i=page - 1: renderer.render(p, i, px)  # noqa: E731
+                prefix += self._t("preview_page_of", page=page, count=count) + " · "
+                selection = self._page_selection_of(path)
+                watermarked = selection is None or page in selection
+            else:
+                size = self._page_size(path, 0)
+            if size is None:
+                return A4, prefix + "⚠ " + self._t("unreadable_pdf"), None, True
         else:
             short, long_ = sorted(PAGE_SIZES[choice])
             size = (long_, short) if self.landscape_button.isChecked() else (short, long_)
@@ -1679,18 +2379,23 @@ class WatermarkWindow(QMainWindow):
                 name = f"{label} · "
                 break
         mm = f"{size[0] * 25.4 / 72:.0f} × {size[1] * 25.4 / 72:.0f} mm"
-        return size, name + mm
+        caption = prefix + name + mm
+        if not watermarked:
+            caption += " · " + self._t("preview_not_watermarked")
+        return size, caption, source, watermarked
 
     def _refresh_preview(self, *_args) -> None:
         if not hasattr(self, "canvas"):
             return
-        page, caption = self._preview_page()
+        size, caption, source, watermarked = self._preview_page()
         self.canvas.set_config(
-            page_size=page,
+            page_size=size,
             caption=caption,
             text=self.text_edit.toPlainText(),
             options=self._get_options(),
             guides=self.guides_switch.isChecked(),
+            source=source,
+            watermarked=watermarked,
         )
 
     # ==================================================================
@@ -1706,7 +2411,7 @@ class WatermarkWindow(QMainWindow):
     def start_generation(self) -> None:
         if self._is_running():
             return
-        if self.input_path is None:
+        if self.input_kind is None:
             self._warn("err_no_input")
             return
 
@@ -1722,10 +2427,12 @@ class WatermarkWindow(QMainWindow):
             self._warn("err_suffix_chars", chars=" ".join(bad))
             return
 
-        if self.input_kind == "file" and not self.input_path.is_file():
-            self._warn("err_invalid_file")
-            return
-        if self.input_kind == "folder":
+        if self.input_kind == "files":
+            missing = [row.path for row in self.file_rows if not row.path.is_file()]
+            if missing:
+                self._warn("err_invalid_file", name=missing[0].name)
+                return
+        else:
             if not self.input_path.is_dir():
                 self._warn("err_invalid_folder")
                 return
@@ -1733,11 +2440,23 @@ class WatermarkWindow(QMainWindow):
                 self._warn("err_no_pdf")
                 return
 
+        page_errors = self._validate_pages()
+        if page_errors:
+            details = "\n".join(f"• {name}: {message}" for name, message in page_errors[:10])
+            self._warn("err_pages", details=details)
+            return
+
         options = self._get_options()
         try:
             WatermarkStyle(text=text, **options)
         except (ValueError, TypeError) as exc:
             QMessageBox.warning(self, self._t("title"), str(exc))
+            return
+
+        overwrite = self.overwrite_switch.isChecked()
+        existing = self._existing_destinations()
+        if existing and not overwrite:
+            self._show_existing(existing)
             return
 
         if not suffix:
@@ -1749,29 +2468,39 @@ class WatermarkWindow(QMainWindow):
 
         # --- Start -----------------------------------------------------
         self.log.clear()
-        if self.input_kind == "file":
-            self._log(self._t("log_start_file", name=self.input_path.name))
+        if self.input_kind == "files":
+            jobs = {row.path: to_page_indices(row.page_selection()) for row in self.file_rows}
+            first_name = self.file_rows[0].path.name
+            self._log(self._t("log_start_files", n=len(jobs)))
+            self.worker = WatermarkWorker(
+                kind="files", text=text, suffix=suffix, overwrite=overwrite,
+                options=options, files=jobs, parent=self,
+            )
         else:
+            pages = to_page_indices(parse_pages(self.folder_pages_edit.text()))
+            first_name = self.input_path.name
             self._log(self._t("log_start_folder", path=self.input_path))
+            self.worker = WatermarkWorker(
+                kind="folder", text=text, suffix=suffix, overwrite=overwrite,
+                options=options, folder=self.input_path, pages=pages,
+                recursive=self.recursive_switch.isChecked(), parent=self,
+            )
 
         self.last_output_dir = None
         self.progress_bar.setRange(0, 0)   # indeterminate while counting pages
-        self._set_status("status_running", {"done": 0, "total": "…", "name": self.input_path.name})
+        self._set_status("status_running", {"done": 0, "total": "…", "name": first_name})
         self._set_running(True)
 
-        self.worker = WatermarkWorker(
-            kind=self.input_kind,
-            path=self.input_path,
-            text=text,
-            suffix=suffix,
-            recursive=self.recursive_switch.isChecked(),
-            options=options,
-            parent=self,
-        )
         self.worker.progress.connect(self._on_progress)
         self.worker.completed.connect(self._on_completed)
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
+
+    def _show_existing(self, paths: list[Path]) -> None:
+        shown = "\n".join(f"• {path}" for path in paths[:10])
+        if len(paths) > 10:
+            shown += "\n…"
+        self._warn("err_exists", paths=shown)
 
     def cancel_generation(self) -> None:
         if self._is_running():
@@ -1806,7 +2535,7 @@ class WatermarkWindow(QMainWindow):
                 self._log(f"✗ {source} — {message[len('ERROR: '):]}")
 
             if created:
-                self.last_output_dir = Path(created[0]).parent if self.input_kind == "file" \
+                self.last_output_dir = Path(created[0]).parent if self.input_kind == "files" \
                     else self._output_location()
             self.progress_bar.setValue(1)
             if errors:
@@ -1818,6 +2547,11 @@ class WatermarkWindow(QMainWindow):
                 QMessageBox.warning(self, self._t("errors_title"), details)
             else:
                 self._set_status("status_done", {"ok": len(created)}, "ok")
+
+        elif status == "exists":
+            self.progress_bar.setValue(0)
+            self._set_status("status_failed", {}, "error")
+            self._show_existing(list(payload))
 
         elif status == "cancelled":
             self.progress_bar.setValue(0)
@@ -1832,6 +2566,7 @@ class WatermarkWindow(QMainWindow):
 
         self._set_running(False)
         self.worker = None
+        self._update_output_label()      # outputs now exist
 
     def open_output_folder(self) -> None:
         if self.last_output_dir is not None and self.last_output_dir.exists():

@@ -31,7 +31,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          # [preview]: pypdfium2, renders the PDF pages in the preview
+          # ("Show source"). tqdm ([progress]) is useless in the GUI.
+          pip install ".[preview]"
           pip install pyinstaller
 
       - name: Build executable (Linux)
@@ -39,6 +41,9 @@ jobs:
         run: |
           pyinstaller --name watermark-pdf --windowed --onefile \
             --add-data "watermark_pdf/resources:watermark_pdf/resources" \
+            --collect-submodules fontTools.ttLib.tables \
+            --collect-all pypdfium2 \
+            --collect-all pypdfium2_raw \
             --icon watermark_pdf/resources/app.png \
             watermark_pdf/__main__.py
 
@@ -47,6 +52,9 @@ jobs:
         run: |
           pyinstaller --name watermark-pdf --windowed --onefile `
             --add-data "watermark_pdf/resources;watermark_pdf/resources" `
+            --collect-submodules fontTools.ttLib.tables `
+            --collect-all pypdfium2 `
+            --collect-all pypdfium2_raw `
             --icon watermark_pdf/resources/app.png `
             watermark_pdf/__main__.py
 
@@ -99,7 +107,7 @@ jobs:
           Depends: libgl1, libxkbcommon-x11-0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-xinerama0, libxcb-xkb1
           Maintainer: Artezaru <artezaru.github@proton.me>
           Description: Add a repeated text watermark to PDF files.
-           Desktop application (PyQt5) to watermark a single PDF or a whole
+           Desktop application (PyQt5) to watermark PDF files or a whole
            folder, with a live preview.
           EOF
 
